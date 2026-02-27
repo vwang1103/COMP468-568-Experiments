@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "mlp_layers.cuh"
 
@@ -82,6 +83,26 @@ void seed_tensor(std::vector<float>& data, float scale) {
     }
 }
 
+// CPU reference
+// weights layout: [out][in] row-major
+// forward per layer: Y = act( X * W^T + b )
+static inline float relu_cpu(float x) { return (x > 0.0f) ? x : 0.0f; }
+
+static inline float gelu_cpu(float x) {
+    // tanh GELU approximation (matches the common GPU approx)
+    constexpr float k0 = 0.7978845608028654f; // sqrt(2/pi)
+    constexpr float k1 = 0.044715f;
+    float x3 = x * x * x;
+    float t = k0 * (x + k1 * x3);
+    return 0.5f * x * (1.0f + std::tanh(t));
+}
+
+static inline float apply_activation_cpu(const std::string& act, float x) {
+    if (act == "relu") return relu_cpu(x);
+    if (act == "gelu") return gelu_cpu(x);
+    return x; // unknown => no-op
+}
+
 void mlp_cpu_reference(const std::vector<int>& layers,
                        int batch,
                        const std::vector<float>& weights,
@@ -91,39 +112,78 @@ void mlp_cpu_reference(const std::vector<int>& layers,
                        const std::vector<float>& input,
                        std::vector<float>& output,
                        const std::string& activation) {
-    /* TODO(student): implement a simple CPU forward pass (GEMM + bias + activation per layer).
-       Remember that weights are stored row-major with shape [out_dim, in_dim]. */
-    (void)layers;
-    (void)batch;
-    (void)weights;
-    (void)biases;
-    (void)weight_offsets;
-    (void)bias_offsets;
-    (void)input;
-    (void)output;
-    (void)activation;
-}
+    const int num_layers = static_cast<int>(layers.size()) - 1;
 
-int main(int argc, char** argv) {
-    Options opt = parse_args(argc, argv);
-    const int batch = opt.batch;
-    const size_t input_elems = static_cast<size_t>(batch) * opt.layers.front();
-    const size_t output_elems = static_cast<size_t>(batch) * opt.layers.back();
-    const int num_layers = static_cast<int>(opt.layers.size()) - 1;
+    // Ping-pong buffers for activations on CPU
+    std::vector<float> a = input; // [batch][layers[0]]
+    std::vector<float> b;
 
-    std::vector<size_t> weight_offsets(num_layers, 0);
-    std::vector<size_t> bias_offsets(num_layers, 0);
-    size_t weight_cursor = 0;
-    size_t bias_cursor = 0;
-    for (int i = 0; i < num_layers; ++i) {
-        const int in_dim = opt.layers[i];
-        const int out_dim = opt.layers[i + 1];
-        weight_offsets[i] = weight_cursor;
-        bias_offsets[i] = bias_cursor;
-        weight_cursor += static_cast<size_t>(out_dim) * in_dim;
-        bias_cursor += static_cast<size_t>(out_dim);
+    for (int layer = 0; layer < num_layers; ++layer) {
+        const int in_dim  = layers[layer];
+        const int out_dim = layers[layer + 1];
+
+        b.assign(static_cast<size_t>(batch) * out_dim, 0.0f);
+
+        const float* W = weights.data() + weight_offsets[layer]; // [out_dim][in_dim]
+        const float* bias = biases.data() + bias_offsets[layer]; // [out_dim]
+
+        for (int r = 0; r < batch; ++r) {
+            const float* a_row = a.data() + static_cast<size_t>(r) * in_dim;
+            float* b_row       = b.data() + static_cast<size_t>(r) * out_dim;
+
+            for (int j = 0; j < out_dim; ++j) {
+                double acc = 0.0;
+                const float* Wrow = W + (size_t)j * in_dim; // W[j,:]
+                for (int i = 0; i < in_dim; ++i) {
+                    acc += static_cast<double>(a_row[i]) * static_cast<double>(Wrow[i]);
+                }
+                acc += static_cast<double>(bias[j]);
+                float out = static_cast<float>(acc);
+                out = apply_activation_cpu(activation, out);
+                b_row[j] = out;
+            }
+        }
+
+        a.swap(b);
     }
 
+    output = a; // final [batch][layers.back()]
+}
+
+// -----------------------
+// Main
+// -----------------------
+int main(int argc, char** argv) {
+    Options opt = parse_args(argc, argv);
+
+    const int batch = opt.batch;
+    const int L = static_cast<int>(opt.layers.size()) - 1;
+
+    // Offsets for packed weights/biases
+    std::vector<size_t> weight_offsets(L, 0);
+    std::vector<size_t> bias_offsets(L, 0);
+
+    size_t weight_cursor = 0;
+    size_t bias_cursor = 0;
+    int max_dim = 0;
+    for (int d : opt.layers) max_dim = std::max(max_dim, d);
+
+    for (int layer = 0; layer < L; ++layer) {
+        const int in  = opt.layers[layer];
+        const int out = opt.layers[layer + 1];
+        weight_offsets[layer] = weight_cursor;
+        bias_offsets[layer] = bias_cursor;
+
+        // weights layout: [out][in]
+        weight_cursor += static_cast<size_t>(out) * in;
+        bias_cursor += static_cast<size_t>(out);
+    }
+
+    const size_t input_elems  = static_cast<size_t>(batch) * opt.layers.front();
+    const size_t output_elems = static_cast<size_t>(batch) * opt.layers.back();
+    const size_t workspace_elems = static_cast<size_t>(batch) * static_cast<size_t>(max_dim);
+
+    // Host buffers
     std::vector<float> h_input(input_elems);
     std::vector<float> h_weights(weight_cursor);
     std::vector<float> h_biases(bias_cursor);
@@ -134,21 +194,27 @@ int main(int argc, char** argv) {
     seed_tensor(h_weights, 0.25f);
     seed_tensor(h_biases, 0.01f);
 
+    // Device buffers
     float* d_input = nullptr;
-    float* d_workspace_a = nullptr;
-    float* d_workspace_b = nullptr;
+    float* d_a = nullptr;
+    float* d_b = nullptr;
     float* d_weights = nullptr;
     float* d_biases = nullptr;
-    /* TODO(student): allocate device buffers (activations + weights + biases) and copy host data. */
-    (void)d_input;
-    (void)d_workspace_a;
-    (void)d_workspace_b;
-    (void)d_weights;
-    (void)d_biases;
 
-    cudaEvent_t start, stop;
-    check_cuda(cudaEventCreate(&start), "create start event");
-    check_cuda(cudaEventCreate(&stop), "create stop event");
+    check_cuda(cudaMalloc(&d_input,   input_elems * sizeof(float)), "cudaMalloc d_input");
+    check_cuda(cudaMalloc(&d_a,       workspace_elems * sizeof(float)), "cudaMalloc d_a");
+    check_cuda(cudaMalloc(&d_b,       workspace_elems * sizeof(float)), "cudaMalloc d_b");
+    check_cuda(cudaMalloc(&d_weights, weight_cursor * sizeof(float)), "cudaMalloc d_weights");
+    check_cuda(cudaMalloc(&d_biases,  bias_cursor * sizeof(float)), "cudaMalloc d_biases");
+
+    check_cuda(cudaMemcpy(d_input,   h_input.data(),   input_elems * sizeof(float), cudaMemcpyHostToDevice),
+               "H2D input");
+    check_cuda(cudaMemcpy(d_weights, h_weights.data(), weight_cursor * sizeof(float), cudaMemcpyHostToDevice),
+               "H2D weights");
+    check_cuda(cudaMemcpy(d_biases,  h_biases.data(),  bias_cursor * sizeof(float), cudaMemcpyHostToDevice),
+               "H2D biases");
+
+    // Stream + cuBLAS + events
     cudaStream_t stream;
     check_cuda(cudaStreamCreate(&stream), "create stream");
 
@@ -156,40 +222,64 @@ int main(int argc, char** argv) {
     check_cublas(cublasCreate(&handle), "cublasCreate");
     check_cublas(cublasSetStream(handle, stream), "cublasSetStream");
 
-    float elapsed_ms = 0.0f;
-    if (opt.impl == "baseline") {
-        check_cuda(cudaEventRecord(start, stream), "record baseline start");
-        for (int layer = 0; layer < num_layers; ++layer) {
+    cudaEvent_t start, stop;
+    check_cuda(cudaEventCreate(&start), "create start event");
+    check_cuda(cudaEventCreate(&stop), "create stop event");
+
+    // Stable timing parameters
+    const int WARMUP_ITERS = 20;
+    const int TIMED_ITERS  = 200;
+
+    // One forward pass helper (end-to-end) – restores input each iter so work is identical
+    auto forward_once = [&]() {
+        // reset input into d_a
+        check_cuda(cudaMemcpyAsync(d_a, d_input, input_elems * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, stream),
+                   "iter restore input");
+
+        for (int layer = 0; layer < L; ++layer) {
             LayerShape shape{batch, opt.layers[layer], opt.layers[layer + 1]};
-            const float* d_w = nullptr;  // TODO(student): offset into d_weights based on layer
-            const float* d_b = nullptr;  // TODO(student): offset into d_biases based on layer
-            run_gemm_layer(d_workspace_a, d_w, d_workspace_b, shape, handle);
-            launch_bias_add(d_b, d_workspace_b, shape, stream);
-            launch_activation(opt.activation, d_workspace_b, shape, stream);
-            std::swap(d_workspace_a, d_workspace_b);
+            const float* d_w = d_weights + weight_offsets[layer];
+            const float* d_bias = d_biases + bias_offsets[layer];
+
+            run_gemm_layer(d_a, d_w, d_b, shape, handle);
+
+            if (opt.impl == "activation_fused") {
+                launch_fused_bias_activation(d_bias, opt.activation, d_b, shape, stream);
+            } else {
+                launch_bias_add(d_bias, d_b, shape, stream);
+                launch_activation(opt.activation, d_b, shape, stream);
+            }
+
+            std::swap(d_a, d_b);
         }
-        check_cuda(cudaEventRecord(stop, stream), "record baseline stop");
-        check_cuda(cudaEventSynchronize(stop), "sync stop");
-        check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed baseline");
-    } else if (opt.impl == "activation_fused") {
-        check_cuda(cudaEventRecord(start, stream), "record fused start");
-        for (int layer = 0; layer < num_layers; ++layer) {
-            LayerShape shape{batch, opt.layers[layer], opt.layers[layer + 1]};
-            const float* d_w = nullptr;  // TODO(student)
-            const float* d_b = nullptr;  // TODO(student)
-            run_gemm_layer(d_workspace_a, d_w, d_workspace_b, shape, handle);
-            launch_fused_bias_activation(d_b, opt.activation, d_workspace_b, shape, stream);
-            std::swap(d_workspace_a, d_workspace_b);
-        }
-        check_cuda(cudaEventRecord(stop, stream), "record fused stop");
-        check_cuda(cudaEventSynchronize(stop), "sync stop");
-        check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed fused");
-    } else {
-        throw std::invalid_argument("Unknown --impl " + opt.impl);
+    };
+
+    // Warmup
+    for (int t = 0; t < WARMUP_ITERS; ++t) {
+        forward_once();
     }
+    check_cuda(cudaStreamSynchronize(stream), "warmup sync");
 
-    /* TODO(student): copy final activations back to h_output. */
+    // Timed loop
+    check_cuda(cudaEventRecord(start, stream), "record start");
+    for (int t = 0; t < TIMED_ITERS; ++t) {
+        forward_once();
+    }
+    check_cuda(cudaEventRecord(stop, stream), "record stop");
+    check_cuda(cudaEventSynchronize(stop), "sync stop");
 
+    float total_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&total_ms, start, stop), "elapsed time");
+    float elapsed_ms = total_ms / static_cast<float>(TIMED_ITERS);
+
+    // After the last forward_once(), final output is in d_a
+    check_cuda(cudaMemcpyAsync(h_output.data(), d_a, output_elems * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream),
+               "D2H output");
+    check_cuda(cudaStreamSynchronize(stream), "sync D2H output");
+
+    // Verify (optional; expensive for large sizes but OK if opt.verify is true)
     if (opt.verify) {
         mlp_cpu_reference(opt.layers,
                           batch,
@@ -200,24 +290,45 @@ int main(int argc, char** argv) {
                           h_input,
                           h_ref,
                           opt.activation);
-        /* TODO(student): compute max absolute difference between h_output and h_ref. */
+
+        float max_abs = 0.0f;
+        float max_rel = 0.0f;
+        for (size_t i = 0; i < output_elems; ++i) {
+            float a = h_output[i];
+            float b = h_ref[i];
+            float diff = std::fabs(a - b);
+            max_abs = std::max(max_abs, diff);
+            float denom = std::max(1.0f, std::fabs(b));
+            max_rel = std::max(max_rel, diff / denom);
+        }
+
+        std::cout << std::scientific;
+        std::cout << "Verify: max_abs_diff=" << max_abs << " max_rel_diff=" << max_rel << "\n";
     }
 
+    // Report perf (mean time per forward pass)
     if (elapsed_ms > 0.0f) {
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "Impl=" << opt.impl << " Batch=" << batch << " Layers=";
         for (size_t i = 0; i < opt.layers.size(); ++i) {
             std::cout << opt.layers[i];
-            if (i + 1 < opt.layers.size()) {
-                std::cout << "x";
-            }
+            if (i + 1 < opt.layers.size()) std::cout << "x";
         }
         std::cout << " Time(ms)=" << elapsed_ms
-                  << " GFLOP/s=" << mlp_gflops(opt.layers, batch, elapsed_ms) << std::endl;
-    } else {
-        std::cout << "Forward pass executed (timing TODO incomplete)." << std::endl;
+                  << " GFLOP/s=" << mlp_gflops(opt.layers, batch, elapsed_ms) << "\n";
     }
 
-    /* TODO(student): cleanup (cudaFree buffers, destroy events/stream/handle). */
+    // Cleanup
+    check_cuda(cudaEventDestroy(start), "destroy start");
+    check_cuda(cudaEventDestroy(stop), "destroy stop");
+    check_cublas(cublasDestroy(handle), "cublasDestroy");
+    check_cuda(cudaStreamDestroy(stream), "destroy stream");
+
+    check_cuda(cudaFree(d_input), "cudaFree d_input");
+    check_cuda(cudaFree(d_a), "cudaFree d_a");
+    check_cuda(cudaFree(d_b), "cudaFree d_b");
+    check_cuda(cudaFree(d_weights), "cudaFree d_weights");
+    check_cuda(cudaFree(d_biases), "cudaFree d_biases");
+
     return 0;
 }

@@ -1,5 +1,5 @@
 NVCC ?= nvcc
-ARCH ?= -arch=sm_70  # change to meet the requirements of the GPU you have
+ARCH ?= -arch=sm_80
 CXXFLAGS ?= -O3 -std=c++17
 INCLUDES := -I./src
 LIBS := -lcublas
