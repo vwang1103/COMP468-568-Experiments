@@ -72,11 +72,29 @@ void conv2d_cpu_reference(const Conv2dShape& shape,
                           const std::vector<float>& weight,
                           std::vector<float>& output) {
     std::fill(output.begin(), output.end(), 0.0f);
+
     /* TODO(student): implement the nested loops over Cout, Hout, Wout, Cin, and KxK.
        Use shape helpers (see conv_kernel.cuh) to translate indices and honor padding. */
-    (void)shape;
-    (void)input;
-    (void)weight;
+    for (int oc = 0; oc < shape.filters; ++oc) {
+        for (int oh = 0; oh < shape.out_height; ++oh) {
+            for (int ow = 0; ow < shape.out_width; ++ow) {
+                float acc = 0.0f;
+                for (int ic = 0; ic < shape.channels; ++ic) {
+                    for (int kh = 0; kh < shape.kernel; ++kh) {
+                        for (int kw = 0; kw < shape.kernel; ++kw) {
+                            int ih = oh * shape.stride - shape.padding + kh;
+                            int iw = ow * shape.stride - shape.padding + kw;
+                            if (ih >= 0 && ih < shape.height && iw >= 0 && iw < shape.width) {
+                                acc += input[input_index(shape, ic, ih, iw)] *
+                                       weight[weight_index(shape, oc, ic, kh, kw)];
+                            }
+                        }
+                    }
+                }
+                output[output_index(shape, oc, oh, ow)] = acc;
+            }
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -98,10 +116,14 @@ int main(int argc, char** argv) {
     float* d_input = nullptr;
     float* d_weight = nullptr;
     float* d_output = nullptr;
+
     /* TODO(student): cudaMalloc device buffers and copy host data (cudaMemcpy H2D). */
-    (void)d_input;
-    (void)d_weight;
-    (void)d_output;
+    check_cuda(cudaMalloc(&d_input, input_elems * sizeof(float)), "malloc d_input");
+    check_cuda(cudaMalloc(&d_weight, weight_elems * sizeof(float)), "malloc d_weight");
+    check_cuda(cudaMalloc(&d_output, output_elems * sizeof(float)), "malloc d_output");
+    check_cuda(cudaMemcpy(d_input, h_input.data(), input_elems * sizeof(float), cudaMemcpyHostToDevice), "memcpy d_input");
+    check_cuda(cudaMemcpy(d_weight, h_weight.data(), weight_elems * sizeof(float), cudaMemcpyHostToDevice), "memcpy d_weight");
+    check_cuda(cudaMemset(d_output, 0, output_elems * sizeof(float)), "memset d_output");
 
     cudaEvent_t start, stop;
     check_cuda(cudaEventCreate(&start), "create start event");
@@ -112,19 +134,35 @@ int main(int argc, char** argv) {
     float elapsed_ms = 0.0f;
     if (opt.impl == "baseline" || opt.impl == "naive") {
         /* TODO(student): record events around launch_naive_conv2d and compute elapsed_ms. */
+        check_cuda(cudaEventRecord(start, stream), "record start");
         launch_naive_conv2d(d_input, d_weight, d_output, shape, stream);
+        check_cuda(cudaEventRecord(stop, stream), "record stop");
+        check_cuda(cudaEventSynchronize(stop), "sync stop");
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed time");
     } else if (opt.impl == "tiled") {
         /* TODO(student): time the shared-memory kernel via launch_tiled_conv2d. */
+        check_cuda(cudaEventRecord(start, stream), "record start");
         launch_tiled_conv2d(d_input, d_weight, d_output, shape, stream);
+        check_cuda(cudaEventRecord(stop, stream), "record stop");
+        check_cuda(cudaEventSynchronize(stop), "sync stop");
+        check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed time");
     } else {
         throw std::invalid_argument("Unknown implementation: " + opt.impl);
     }
 
     /* TODO(student): copy device output back to h_output (cudaMemcpy D2H). */
+    check_cuda(cudaMemcpy(h_output.data(), d_output, output_elems * sizeof(float), cudaMemcpyDeviceToHost), "memcpy D2H");
 
     if (opt.verify) {
         conv2d_cpu_reference(shape, h_input, h_weight, h_ref);
+
         /* TODO(student): compute max absolute error between h_output and h_ref. */
+        float max_err = 0.0f;
+        for (size_t i = 0; i < output_elems; ++i) {
+            max_err = std::max(max_err, std::fabs(h_output[i] - h_ref[i]));
+        }
+        std::cout << "Max absolute error: " << max_err
+                  << (max_err <= 1e-3f ? " [PASS]" : " [FAIL]") << std::endl;
     }
 
     if (elapsed_ms > 0.0f) {
@@ -137,6 +175,12 @@ int main(int argc, char** argv) {
         std::cout << "Impl=" << opt.impl << " executed (timing TODO not yet implemented)" << std::endl;
     }
 
-    /* TODO(student): free device memory and destroy CUDA events/streams. */
+     /* TODO(student): free device memory and destroy CUDA events/streams. */
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaStreamDestroy(stream);
     return 0;
 }

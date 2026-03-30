@@ -48,6 +48,7 @@ inline __host__ __device__ int output_index(const Conv2dShape& shape, int oc, in
 }
 
 constexpr int BLOCK_SIZE = 16;
+constexpr int TILE_C = 8;  // input channels batched per shared-memory load in tiled kernel
 
 inline dim3 make_conv_grid(const Conv2dShape& shape) {
     return dim3((shape.out_width + BLOCK_SIZE - 1) / BLOCK_SIZE,
@@ -66,31 +67,116 @@ __global__ void conv2d_naive_kernel(const float* __restrict__ input,
         return;
     }
 
-    float acc = 0.0f;
     /* TODO(student): loop over channels/ksize and accumulate into acc. Remember padding offsets:
        ih = oh * stride - padding + kh;
        iw = ow * stride - padding + kw;
        Skip taps that fall outside the padded image. */
+    const int H = shape.height;
+    const int W = shape.width;
+    const int C = shape.channels;
+    const int K = shape.kernel;
+    const int ih_base = oh * shape.stride - shape.padding;
+    const int iw_base = ow * shape.stride - shape.padding;
+
+    float acc = 0.0f;
+    for (int ic = 0; ic < C; ++ic) {
+        const int in_c_off = ic * H * W;
+        const int w_ic_off = (oc * C + ic) * K * K;
+        for (int kh = 0; kh < K; ++kh) {
+            const int ih = ih_base + kh;
+            if (ih < 0 || ih >= H) continue;
+            const int in_row_off = in_c_off + ih * W;
+            const int w_row_off = w_ic_off + kh * K;
+            for (int kw = 0; kw < K; ++kw) {
+                const int iw = iw_base + kw;
+                if (iw >= 0 && iw < W) {
+                    acc += __ldg(&input[in_row_off + iw]) *
+                           __ldg(&weight[w_row_off + kw]);
+                }
+            }
+        }
+    }
     output[output_index(shape, oc, oh, ow)] = acc;
-    (void)input;
-    (void)weight;
 }
 
 __global__ void conv2d_tiled_kernel(const float* __restrict__ input,
                                     const float* __restrict__ weight,
                                     float* __restrict__ output,
                                     Conv2dShape shape) {
-    extern __shared__ float tile[];
-    float* tile_input = tile;                              // BLOCK_SIZE^2 * Cin chunk (student-defined)
-    float* tile_weight = tile + BLOCK_SIZE * BLOCK_SIZE;   // placeholder layout suggestion
     /* TODO(student): stage input patches / filter tiles into shared memory and reuse them
        across threads within the block. Carefully handle halos caused by padding. */
-    (void)tile_input;
-    (void)tile_weight;
-    (void)output;
-    (void)shape;
-    (void)input;
-    (void)weight;
+    const int ow = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    const int oh = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    const int oc = blockIdx.z;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int K = shape.kernel;
+    const int H = shape.height;
+    const int W = shape.width;
+    const int C = shape.channels;
+    const int S = shape.stride;
+    const int P = shape.padding;
+
+    const int tile_h = BLOCK_SIZE + K - 1;
+    const int tile_w = BLOCK_SIZE + K - 1;
+    const int tile_spatial = tile_h * tile_w;
+
+    extern __shared__ float smem[];  // TILE_C * tile_spatial floats
+
+    float acc = 0.0f;
+
+    const int base_ih = blockIdx.y * BLOCK_SIZE * S - P;
+    const int base_iw = blockIdx.x * BLOCK_SIZE * S - P;
+    const int tid = ty * BLOCK_SIZE + tx;
+    const int threads = BLOCK_SIZE * BLOCK_SIZE;
+    const bool in_bounds = (ow < shape.out_width && oh < shape.out_height);
+    const int sh = ty * S;
+    const int sw = tx * S;
+
+    // Process TILE_C input channels per shared-memory load to amortize __syncthreads cost
+    for (int ic_start = 0; ic_start < C; ic_start += TILE_C) {
+        const int nc = min(TILE_C, C - ic_start);
+        const int total_load = nc * tile_spatial;
+
+        // Cooperatively load nc channels' input patches into shared memory
+        for (int idx = tid; idx < total_load; idx += threads) {
+            const int c_local = idx / tile_spatial;
+            const int s_idx = idx - c_local * tile_spatial;
+            const int local_h = s_idx / tile_w;
+            const int local_w = s_idx - local_h * tile_w;
+            const int ih = base_ih + local_h;
+            const int iw = base_iw + local_w;
+            const int ic = ic_start + c_local;
+            float val = 0.0f;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W && ic < C) {
+                val = __ldg(&input[(ic * H + ih) * W + iw]);
+            }
+            smem[idx] = val;
+        }
+        __syncthreads();
+
+        // Accumulate over the batched channels from shared memory
+        if (in_bounds) {
+            for (int c_local = 0; c_local < nc; ++c_local) {
+                const float* tile = smem + c_local * tile_spatial;
+                const int ic = ic_start + c_local;
+                const int w_base = ((oc * C + ic) * K) * K;
+                for (int kh = 0; kh < K; ++kh) {
+                    const int tile_row = (sh + kh) * tile_w + sw;
+                    const int w_row = w_base + kh * K;
+                    for (int kw = 0; kw < K; ++kw) {
+                        acc += tile[tile_row + kw] * __ldg(&weight[w_row + kw]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (in_bounds && oc < shape.filters) {
+        output[(oc * shape.out_height + oh) * shape.out_width + ow] = acc;
+    }
 }
 
 inline void launch_naive_conv2d(const float* d_input,
@@ -102,6 +188,10 @@ inline void launch_naive_conv2d(const float* d_input,
     dim3 grid = make_conv_grid(shape);
     conv2d_naive_kernel<<<grid, block, 0, stream>>>(d_input, d_weight, d_output, shape);
     /* TODO(student): check cudaGetLastError() and optionally cudaDeviceSynchronize() when debugging. */
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("naive kernel launch error: %s\n", cudaGetErrorString(err));
+    }
 }
 
 inline void launch_tiled_conv2d(const float* d_input,
@@ -111,12 +201,16 @@ inline void launch_tiled_conv2d(const float* d_input,
                                 cudaStream_t stream) {
     dim3 block(BLOCK_SIZE, BLOCK_SIZE, 1);
     dim3 grid = make_conv_grid(shape);
-    size_t shared_bytes = 2 * BLOCK_SIZE * BLOCK_SIZE * sizeof(float);
-    conv2d_tiled_kernel<<<grid, block, shared_bytes, stream>>>(d_input, d_weight, d_output, shape);
     /* TODO(student): choose a better shared-memory layout/size expression once kernels are implemented. */
-    (void)d_input;
-    (void)d_weight;
-    (void)d_output;
+    const int tile_h = BLOCK_SIZE + shape.kernel - 1;
+    const int tile_w = BLOCK_SIZE + shape.kernel - 1;
+    int nc = min(TILE_C, shape.channels);
+    size_t shared_bytes = static_cast<size_t>(nc) * tile_h * tile_w * sizeof(float);
+    conv2d_tiled_kernel<<<grid, block, shared_bytes, stream>>>(d_input, d_weight, d_output, shape);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("tiled kernel launch error: %s\n", cudaGetErrorString(err));
+    }
 }
 
 inline double conv_gflops(const Conv2dShape& shape, double millis) {
