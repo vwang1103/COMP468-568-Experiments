@@ -45,10 +45,19 @@ __global__ void sddmm_csr_baseline_kernel(
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= nnz) return;
 
-    // TODO student: read source row i from d_row_indices[p]
-    // TODO student: read destination column j from d_col_idx[p]
-    // TODO student: compute dot product of E[i,:] and E[j,:] over D dimensions
-    // TODO student: write result to d_vals[p]
+    // read source row i from d_row_indices[p]
+    int i = d_row_indices[p];
+    // read destination column j from d_col_idx[p]
+    int j = d_col_idx[p];
+
+    // compute dot product of E[i,:] and E[j,:] over D dimensions
+    float_t dot = 0.0f;
+    for (int d = 0; d < D; d++) {
+        dot += d_E[(size_t)i * D + d] * d_E[(size_t)j * D + d];
+    }
+
+    // write result to d_vals[p]
+    d_vals[p] = dot;
 }
 
 /*
@@ -69,10 +78,25 @@ __global__ void spmm_csr_row_kernel(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= M) return;
 
-    // TODO student: init output row
-    // TODO student: load start, end
-    // TODO student: loop over p in row nnz
-    // TODO student: accumulate into d_C[row*N + j]
+    // init output row
+    for (int j = 0; j < N; j++) {
+        d_C[(size_t)row * N + j] = 0.0f;
+    }
+
+    // load start, end
+    int start = d_row_ptr[row];
+    int end   = d_row_ptr[row + 1];
+
+    // loop over p in row nnz
+    for (int p = start; p < end; p++) {
+        int col = d_col_idx[p];
+        float_t val = d_vals[p];
+
+        // accumulate into d_C[row*N + j]
+        for (int j = 0; j < N; j++) {
+            d_C[(size_t)row * N + j] += val * d_B[(size_t)col * N + j];
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -124,11 +148,19 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_E, E.data(), (size_t)M * D * sizeof(float), cudaMemcpyHostToDevice);
 
     // === Step 1: SDDMM on GPU ===
+    float sddmm_ms = 0;
     {
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0); cudaEventCreate(&t1);
         int block = 256;
         int grid = (nnz + block - 1) / block;
+        cudaEventRecord(t0);
         sddmm_csr_baseline_kernel<<<grid, block>>>(nnz, D, d_row_indices, d_col_idx, d_E, d_vals);
-        cudaDeviceSynchronize();
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        cudaEventElapsedTime(&sddmm_ms, t0, t1);
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        std::cout << "SDDMM baseline time: " << sddmm_ms << " ms\n";
     }
 
     // Validate SDDMM
@@ -142,11 +174,19 @@ int main(int argc, char** argv) {
         std::cout << "SDDMM FAILED\n";
 
     // === Step 2: SpMM on GPU (uses SDDMM output d_vals) ===
+    float spmm_ms = 0;
     {
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0); cudaEventCreate(&t1);
         int block = 256;
         int grid = (M + block - 1) / block;
+        cudaEventRecord(t0);
         spmm_csr_row_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_vals, d_E, d_C);
-        cudaDeviceSynchronize();
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        cudaEventElapsedTime(&spmm_ms, t0, t1);
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        std::cout << "SpMM  baseline time: " << spmm_ms << " ms\n";
     }
 
     // Validate SpMM
@@ -158,6 +198,10 @@ int main(int argc, char** argv) {
         std::cout << "SpMM  PASSED\n";
     else
         std::cout << "SpMM  FAILED\n";
+
+    // Print CSV line: kernel,time_ms
+    std::cout << "TIMING_CSV,baseline_sddmm," << sddmm_ms << "\n";
+    std::cout << "TIMING_CSV,baseline_spmm," << spmm_ms << "\n";
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_idx);

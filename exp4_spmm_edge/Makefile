@@ -1,6 +1,6 @@
 
 NVCC=nvcc
-ARCH=sm_70  # Change to sm_80 for A100, sm_90 for H100
+ARCH=sm_80  # Change to sm_80 for A100, sm_90 for H100
 
 all: spmm_baseline spmm_opt
 
