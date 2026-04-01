@@ -129,12 +129,9 @@ int main() {
     srand(42);
     for (size_t i = 0; i < E.size(); i++) E[i] = float(rand()) / RAND_MAX;
 
-    // === CPU Reference ===
+    // === CPU Reference: SDDMM ===
     std::vector<float> vals_ref;
     sddmm_cpu(M, D, row_ptr, col_idx, E, vals_ref);
-
-    std::vector<float> C_ref;
-    spmm_cpu(M, M, D, row_ptr, col_idx, vals_ref, E, C_ref);
 
     // === GPU Setup ===
     int *d_row_ptr, *d_col_idx;
@@ -154,18 +151,25 @@ int main() {
     int grid = (total_threads + block - 1) / block;
     std::cout << "Launching warp kernels: Grid=" << grid << ", Block=" << block << "\n";
 
-    // === Step 1: SDDMM on GPU ===
+    // === Step 1: SDDMM on GPU (warmup + averaged timing) ===
     float sddmm_ms = 0;
     {
+        // Warmup
+        for (int i = 0; i < 10; i++)
+            sddmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_E, d_vals);
+        cudaDeviceSynchronize();
+        // Timed iterations
         cudaEvent_t t0, t1;
         cudaEventCreate(&t0); cudaEventCreate(&t1);
         cudaEventRecord(t0);
-        sddmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_E, d_vals);
+        for (int i = 0; i < 100; i++)
+            sddmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_E, d_vals);
         cudaEventRecord(t1);
         cudaEventSynchronize(t1);
-        cudaEventElapsedTime(&sddmm_ms, t0, t1);
+        float total;
+        cudaEventElapsedTime(&total, t0, t1);
+        sddmm_ms = total / 100.0f;
         cudaEventDestroy(t0); cudaEventDestroy(t1);
-        std::cout << "SDDMM warp time: " << sddmm_ms << " ms\n";
     }
 
     // Validate SDDMM
@@ -178,18 +182,29 @@ int main() {
     else
         std::cout << "SDDMM FAILED\n";
 
-    // === Step 2: SpMM on GPU (uses SDDMM output d_vals) ===
+    // CPU Reference: SpMM using GPU SDDMM output (isolates SpMM error)
+    std::vector<float> C_ref;
+    spmm_cpu(M, M, D, row_ptr, col_idx, vals_gpu, E, C_ref);
+
+    // === Step 2: SpMM on GPU (warmup + averaged timing) ===
     float spmm_ms = 0;
     {
+        // Warmup
+        for (int i = 0; i < 10; i++)
+            spmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_vals, d_E, d_C);
+        cudaDeviceSynchronize();
+        // Timed iterations
         cudaEvent_t t0, t1;
         cudaEventCreate(&t0); cudaEventCreate(&t1);
         cudaEventRecord(t0);
-        spmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_vals, d_E, d_C);
+        for (int i = 0; i < 100; i++)
+            spmm_csr_warp_kernel<<<grid, block>>>(M, D, d_row_ptr, d_col_idx, d_vals, d_E, d_C);
         cudaEventRecord(t1);
         cudaEventSynchronize(t1);
-        cudaEventElapsedTime(&spmm_ms, t0, t1);
+        float total;
+        cudaEventElapsedTime(&total, t0, t1);
+        spmm_ms = total / 100.0f;
         cudaEventDestroy(t0); cudaEventDestroy(t1);
-        std::cout << "SpMM  warp time: " << spmm_ms << " ms\n";
     }
 
     // Validate SpMM
@@ -203,8 +218,10 @@ int main() {
         std::cout << "SpMM  FAILED\n";
 
     // Print CSV line: kernel,time_ms
-    std::cout << "TIMING_CSV,warp_sddmm," << sddmm_ms << "\n";
-    std::cout << "TIMING_CSV,warp_spmm," << spmm_ms << "\n";
+    float total_ms = sddmm_ms + spmm_ms;
+    std::cout << "sddmm time: " << sddmm_ms << " ms\n";
+    std::cout << "spmm time: " << spmm_ms << " ms\n";
+    std::cout << "Two-Step GNN optimized total time: " << total_ms << " ms\n";
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_idx);
