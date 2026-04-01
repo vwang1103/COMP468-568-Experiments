@@ -132,22 +132,39 @@ int main(int argc, char** argv) {
     check_cuda(cudaStreamCreate(&stream), "create stream");
 
     float elapsed_ms = 0.0f;
+    const int warmup = 5;
+    const int iters = 20;
+
     if (opt.impl == "baseline" || opt.impl == "naive") {
         /* TODO(student): record events around launch_naive_conv2d and compute elapsed_ms. */
+        for (int i = 0; i < warmup; ++i) {
+            launch_naive_conv2d(d_input, d_weight, d_output, shape, stream);
+        }
+        check_cuda(cudaStreamSynchronize(stream), "warmup sync");
+
         check_cuda(cudaEventRecord(start, stream), "record start");
-        launch_naive_conv2d(d_input, d_weight, d_output, shape, stream);
+        for (int i = 0; i < iters; ++i) {
+            launch_naive_conv2d(d_input, d_weight, d_output, shape, stream);
+        }
         check_cuda(cudaEventRecord(stop, stream), "record stop");
         check_cuda(cudaEventSynchronize(stop), "sync stop");
         check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed time");
+        elapsed_ms /= iters;
     } else if (opt.impl == "tiled") {
         /* TODO(student): time the shared-memory kernel via launch_tiled_conv2d. */
+        for (int i = 0; i < warmup; ++i) {
+            launch_tiled_conv2d(d_input, d_weight, d_output, shape, stream);
+        }
+        check_cuda(cudaStreamSynchronize(stream), "warmup sync");
+
         check_cuda(cudaEventRecord(start, stream), "record start");
-        launch_tiled_conv2d(d_input, d_weight, d_output, shape, stream);
+        for (int i = 0; i < iters; ++i) {
+            launch_tiled_conv2d(d_input, d_weight, d_output, shape, stream);
+        }
         check_cuda(cudaEventRecord(stop, stream), "record stop");
         check_cuda(cudaEventSynchronize(stop), "sync stop");
         check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "elapsed time");
-    } else {
-        throw std::invalid_argument("Unknown implementation: " + opt.impl);
+        elapsed_ms /= iters;
     }
 
     /* TODO(student): copy device output back to h_output (cudaMemcpy D2H). */
