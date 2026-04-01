@@ -6,9 +6,8 @@ EXP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$EXP_DIR/bin/dconv2d"
 
 SPATIAL=(256 512 1024)
-SPATIAL=(256 512 1024)
 FILTERS=(32 64 128)
-IMPLS=(tiled naive)
+IMPLS=(naive tiled)
 CIN=32
 K=3
 STRIDE=1
