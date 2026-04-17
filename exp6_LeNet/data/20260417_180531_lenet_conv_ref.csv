@@ -1,0 +1,4 @@
+batch,cudnn_implicit_gemm_ref_gflops
+32,362.34
+64,719.18
+128,1172.48
